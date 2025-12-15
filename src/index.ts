@@ -1,0 +1,1489 @@
+import cluster from 'cluster'
+import type { Worker } from 'cluster'
+// Use Page type from playwright for typings; at runtime rebrowser-playwright extends playwright
+import type { Page } from 'playwright'
+import type { AxiosRequestConfig } from 'axios'
+import { createBrowserInstance } from './util/browser/BrowserFactory'
+import BrowserFunc from './browser/BrowserFunc'
+import BrowserUtil from './browser/BrowserUtil'
+
+import { log } from './util/Logger'
+import { Util } from './util/Utils'
+import { loadAccounts, loadConfig, saveSessionData } from './util/Load'
+import { DISCORD } from './constants'
+
+import { Login } from './functions/Login'
+import { Workers } from './functions/Workers'
+import { Activities } from './functions/Activities'
+import { MobileFlow } from './MobileFlow'
+import { DesktopFlow } from './DesktopFlow'
+
+import { Account } from './interface/Account'
+import Axios from './util/Axios'
+import { QueryDiversityEngine } from './util/QueryDiversityEngine'
+import fs from 'fs'
+import path from 'path'
+import { spawn } from 'child_process'
+import Humanizer from './util/Humanizer'
+import { detectBanReason } from './util/BanDetector'
+import { MobileRetryTracker } from './util/MobileRetryTracker'
+
+
+// Main bot class
+export class MicrosoftRewardsBot {
+    public log: typeof log
+    public config
+    public utils: Util
+    public activities: Activities = new Activities(this)
+    public login!: Login
+    public browser: {
+        func: BrowserFunc,
+        utils: BrowserUtil
+    }
+    public humanizer: Humanizer
+    public isMobile: boolean
+    public homePage!: Page
+    public currentAccountEmail?: string
+    public currentAccountRecoveryEmail?: string
+    public queryEngine?: QueryDiversityEngine
+    public compromisedModeActive: boolean = false
+    public compromisedReason?: string
+    public compromisedEmail?: string
+    public workers: Workers
+    // Mutex-like flag to prevent parallel execution when config.parallel is accidentally misconfigured
+    private isDesktopRunning: boolean = false
+    private isMobileRunning: boolean = false
+
+    private activeWorkers: number
+    private accounts: Account[]
+    // Buy mode (manual spending) tracking
+    private buyMode: { enabled: boolean; email?: string } = { enabled: false }
+
+    // Summary collection (per process)
+    private accountSummaries: AccountSummary[] = []
+    private runId: string = Math.random().toString(36).slice(2)
+    private diagCount: number = 0
+    private bannedTriggered: { email: string; reason: string } | null = null
+    private globalStandby: { active: boolean; reason?: string } = { active: false }
+    // Scheduler heartbeat integration
+    private heartbeatFile?: string
+    private heartbeatTimer?: NodeJS.Timeout
+
+    public axios!: Axios
+
+    constructor(isMobile: boolean) {
+        this.isMobile = isMobile
+        this.log = log
+
+        this.accounts = []
+        this.utils = new Util()
+        this.config = loadConfig()
+        this.browser = {
+            func: new BrowserFunc(this),
+            utils: new BrowserUtil(this)
+        }
+        this.login = new Login(this) // Fixed: Initialize Login instance
+        this.workers = new Workers(this)
+        this.humanizer = new Humanizer(this.utils, this.config.humanization)
+        this.activeWorkers = this.config.clusters
+        //this.mobileRetryAttempts = 0
+        
+        // Buy mode: CLI args take precedence over config
+        const idx = process.argv.indexOf('-buy')
+        if (idx >= 0) {
+            const target = process.argv[idx + 1]
+            this.buyMode = target && /@/.test(target) 
+                ? { enabled: true, email: target }
+                : { enabled: true }
+        } else {
+            // Fallback to config if no CLI flag
+            const buyModeConfig = this.config.buyMode as { enabled?: boolean } | undefined
+            if (buyModeConfig?.enabled === true) {
+                this.buyMode.enabled = true
+            }
+        }
+    }
+
+    public isBuyModeEnabled(): boolean {
+        return this.buyMode.enabled === true
+    }
+
+    public getBuyModeTarget(): string | undefined {
+        return this.buyMode.email
+    }
+
+    async initialize() {
+        this.accounts = loadAccounts()
+    }
+    private buildQueryEngine(): QueryDiversityEngine | undefined {
+        if (!this.config.queryDiversity?.enabled) {
+            return undefined
+        }
+
+        const proxyHttpClient = {
+            request: (config: AxiosRequestConfig) => this.axios.request(config)
+        }
+
+        const logger = (source: string, message: string, level: 'info' | 'warn' | 'error' = 'info') => {
+            const mapped = level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'log'
+            this.log(this.isMobile, source, message, mapped)
+        }
+
+        return new QueryDiversityEngine({
+            sources: this.config.queryDiversity.sources,
+            maxQueriesPerSource: this.config.queryDiversity.maxQueriesPerSource,
+            cacheMinutes: this.config.queryDiversity.cacheMinutes
+        }, logger, proxyHttpClient)
+    }
+    async run() {
+        this.printBanner()
+        log('main', 'MAIN', `Bot started with ${this.config.clusters} clusters`)
+
+        // If scheduler provided a heartbeat file, update it periodically to signal liveness
+        const hbFile = process.env.SCHEDULER_HEARTBEAT_FILE
+        if (hbFile) {
+            try {
+                const dir = path.dirname(hbFile)
+                if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+                fs.writeFileSync(hbFile, String(Date.now()))
+                this.heartbeatFile = hbFile
+                this.heartbeatTimer = setInterval(() => {
+                    try { fs.writeFileSync(hbFile, String(Date.now())) } catch { /* ignore */ }
+                }, 60_000)
+            } catch { /* ignore */ }
+        }
+
+        // If buy mode is enabled, run single-account interactive session without automation
+        if (this.buyMode.enabled) {
+            const targetInfo = this.buyMode.email ? ` for ${this.buyMode.email}` : ''
+            log('main', 'BUY-MODE', `Buy mode ENABLED${targetInfo}. We'll open 2 tabs: (1) a monitor tab that auto-refreshes to track points, (2) your browsing tab to redeem/purchase freely.`, 'log', 'green')
+            log('main', 'BUY-MODE', 'The monitor tab may refresh every ~10s. Use the other tab for your actions; monitoring is passive and non-intrusive.', 'log', 'yellow')
+            await this.runBuyMode()
+            return
+        }
+
+        // Only cluster when there's more than 1 cluster demanded
+        if (this.config.clusters > 1) {
+            if (cluster.isPrimary) {
+                //this.runMaster()
+                this.runMaster2()
+            } else {
+                //this.runWorker()
+                this.runWorker2()
+            }
+        } else {
+            await this.runTasks(this.accounts)
+        }
+    }
+
+    /** Manual spending session: login, then leave control to user while we passively monitor points. */
+    private async runBuyMode() {
+        try {
+            await this.initialize()
+            const email = this.buyMode.email || (this.accounts[0]?.email)
+            const account = this.accounts.find(a => a.email === email) || this.accounts[0]
+            if (!account) throw new Error('No account available for buy mode')
+
+            this.isMobile = false
+            this.axios = new Axios(account.proxy)
+            const browser = await createBrowserInstance(this, account.proxy, account.email)
+            // Open the monitor tab FIRST so auto-refresh happens out of the way
+            let monitor = await browser.newPage()
+            await this.login.login(monitor, account.email, account.password, account.totp)
+            await this.browser.func.goHome(monitor)
+            this.log(false, 'BUY-MODE', 'Opened MONITOR tab (auto-refreshes to track points).', 'log', 'yellow')
+
+            // Then open the user free-browsing tab SECOND so users don’t see the refreshes
+            const page = await browser.newPage()
+            await this.browser.func.goHome(page)
+            this.log(false, 'BUY-MODE', 'Opened USER tab (use this one to redeem/purchase freely).', 'log', 'green')
+
+            // Helper to recreate monitor tab if the user closes it
+            const recreateMonitor = async () => {
+                try { if (!monitor.isClosed()) await monitor.close() } catch { /* ignore */ }
+                monitor = await browser.newPage()
+                await this.browser.func.goHome(monitor)
+            }
+
+            // Helper to send an immediate spend notice via webhooks/NTFY
+            const sendSpendNotice = async (delta: number, nowPts: number, cumulativeSpent: number) => {
+                try {
+                    const { ConclusionWebhook } = await import('./util/ConclusionWebhook')
+                    await ConclusionWebhook(
+                        this.config,
+                        '💳 Spend Detected',
+                        `**Account:** ${account.email}\n**Spent:** -${delta} points\n**Current:** ${nowPts} points\n**Session spent:** ${cumulativeSpent} points`,
+                        undefined,
+                        0xFFAA00
+                    )
+                } catch (e) {
+                    this.log(false, 'BUY-MODE', `Failed to send spend notice: ${e instanceof Error ? e.message : e}`, 'warn')
+                }
+            }
+            let initial = 0
+            try {
+                const data = await this.browser.func.getDashboardData(monitor)
+                initial = data.userStatus.availablePoints || 0
+            } catch {/* ignore */}
+
+            this.log(false, 'BUY-MODE', `Logged in as ${account.email}. Buy mode is active: monitor tab auto-refreshes; user tab is free for your actions. We'll observe points passively.`)
+
+            // Passive watcher: poll points periodically without clicking.
+            const start = Date.now()
+            let last = initial
+            let spent = 0
+
+            const buyModeConfig = this.config.buyMode as { maxMinutes?: number } | undefined
+            const maxMinutes = Math.max(10, buyModeConfig?.maxMinutes ?? 45)
+            const endAt = start + maxMinutes * 60 * 1000
+
+            while (Date.now() < endAt) {
+                await this.utils.wait(10000)
+
+                // If monitor tab was closed by user, recreate it quietly
+                try {
+                    if (monitor.isClosed()) {
+                        this.log(false, 'BUY-MODE', 'Monitor tab was closed; reopening in background...', 'warn')
+                        await recreateMonitor()
+                    }
+                } catch { /* ignore */ }
+
+                try {
+                    const data = await this.browser.func.getDashboardData(monitor)
+                    const nowPts = data.userStatus.availablePoints || 0
+                    if (nowPts < last) {
+                        // Points decreased -> likely spent
+                        const delta = last - nowPts
+                        spent += delta
+                        last = nowPts
+                        this.log(false, 'BUY-MODE', `Detected spend: -${delta} points (current: ${nowPts})`)
+                        // Immediate spend notice
+                        await sendSpendNotice(delta, nowPts, spent)
+                    } else if (nowPts > last) {
+                        last = nowPts
+                    }
+                } catch (err) {
+                    // If we lost the page context, recreate the monitor tab and continue
+                    const msg = err instanceof Error ? err.message : String(err)
+                    if (/Target closed|page has been closed|browser has been closed/i.test(msg)) {
+                        this.log(false, 'BUY-MODE', 'Monitor page closed or lost; recreating...', 'warn')
+                        try { await recreateMonitor() } catch { /* ignore */ }
+                    }
+                    // Swallow other errors to avoid disrupting the user
+                }
+            }
+
+            // Save cookies and close monitor; keep main page open for user until they close it themselves
+            try { 
+                await saveSessionData(this.config.sessionPath, browser, account.email, this.isMobile) 
+            } catch (e) { 
+                log(false, 'BUY-MODE', `Failed to save session: ${e instanceof Error ? e.message : String(e)}`, 'warn')
+            }
+            try { if (!monitor.isClosed()) await monitor.close() } catch {/* ignore */}
+
+            // Send a final minimal conclusion webhook for this manual session
+            const summary: AccountSummary = {
+                email: account.email,
+                durationMs: Date.now() - start,
+                desktopCollected: 0,
+                mobileCollected: 0,
+                totalCollected: -spent, // negative indicates spend
+                initialTotal: initial,
+                endTotal: last,
+                errors: [],
+                banned: { status: false, reason: '' }
+            }
+            await this.sendConclusion([summary])
+
+            this.log(false, 'BUY-MODE', 'Buy mode session finished (monitoring period ended). You can close the browser when done.')
+        } catch (e) {
+            this.log(false, 'BUY-MODE', `Error in buy mode: ${e instanceof Error ? e.message : e}`, 'error')
+        }
+    }
+
+    private printBanner() {
+        // Only print once (primary process or single cluster execution)
+        if (this.config.clusters > 1 && !cluster.isPrimary) return
+        
+        const banner = `
+ ╔═════════════════════════════════════════════════════════════════════════════════════╗
+ ║                                                                                     ║
+ ║  ███╗   ███╗███████╗    ██████╗ ███████╗██╗    ██╗ █████╗ ██████╗ ██████╗ ███████╗  ║
+ ║  ████╗ ████║██╔════╝    ██╔══██╗██╔════╝██║    ██║██╔══██╗██╔══██╗██╔══██╗██╔════╝  ║
+ ║  ██╔████╔██║███████╗    ██████╔╝█████╗  ██║ █╗ ██║███████║██████╔╝██║  ██║███████╗  ║
+ ║  ██║╚██╔╝██║╚════██║    ██╔══██╗██╔══╝  ██║███╗██║██╔══██║██╔══██╗██║  ██║╚════██║  ║
+ ║  ██║ ╚═╝ ██║███████║    ██║  ██║███████╗╚███╔███╔╝██║  ██║██║  ██║██████╔╝███████║  ║
+ ║  ╚═╝     ╚═╝╚══════╝    ╚═╝  ╚═╝╚══════╝ ╚══╝╚══╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝ ╚══════╝  ║
+ ║                                                                                     ║
+ ║          TypeScript • Playwright • Intelligent Automation                           ║
+ ║                                                                                     ║
+ ╚═════════════════════════════════════════════════════════════════════════════════════╝
+`
+
+        const buyModeBanner = `
+ ╔══════════════════════════════════════════════════════╗
+ ║                                                      ║
+ ║  ███╗   ███╗███████╗    ██████╗ ██╗   ██╗██╗   ██╗   ║
+ ║  ████╗ ████║██╔════╝    ██╔══██╗██║   ██║╚██╗ ██╔╝   ║
+ ║  ██╔████╔██║███████╗    ██████╔╝██║   ██║ ╚████╔╝    ║
+ ║  ██║╚██╔╝██║╚════██║    ██╔══██╗██║   ██║  ╚██╔╝     ║
+ ║  ██║ ╚═╝ ██║███████║    ██████╔╝╚██████╔╝   ██║      ║
+ ║  ╚═╝     ╚═╝╚══════╝    ╚═════╝  ╚═════╝    ╚═╝      ║
+ ║                                                      ║
+ ║      Manual Purchase Mode • Passive Monitoring       ║
+ ║                                                      ║
+ ╚══════════════════════════════════════════════════════╝
+`
+        
+        // Read package version and build banner info
+        const pkgPath = path.join(__dirname, '../', 'package.json')
+        let version = 'unknown'
+        try {
+            if (fs.existsSync(pkgPath)) {
+                const raw = fs.readFileSync(pkgPath, 'utf-8')
+                const pkg = JSON.parse(raw)
+                version = pkg.version || version
+            }
+        } catch { 
+            // Ignore version read errors
+        }
+        
+        // Display appropriate banner based on mode
+        const displayBanner = this.buyMode.enabled ? buyModeBanner : banner
+        console.log(displayBanner)
+        console.log('='.repeat(80))
+            
+            if (this.buyMode.enabled) {
+                console.log(`  Version: ${version} | Process: ${process.pid} | Buy Mode: Active`)
+                console.log(`  Target: ${this.buyMode.email || 'First account'} | Documentation: buy-mode.md`)
+            } else {
+                console.log(`  Version: ${version} | Process: ${process.pid} | Clusters: ${this.config.clusters}`)
+                // Replace visibility/parallel with concise enabled feature status
+                const upd = this.config.update || {}
+                const updTargets: string[] = []
+                if (upd.git !== false) updTargets.push('Git')
+                if (upd.docker) updTargets.push('Docker')
+                if (updTargets.length > 0) {
+                    console.log(`  Update: ${updTargets.join(', ')}`)
+                }
+
+                const sched = this.config.schedule || {}
+                const schedEnabled = !!sched.enabled
+                if (!schedEnabled) {
+                    console.log('  Schedule: OFF')
+                } else {
+                    // Determine active format + time string to display
+                    const tz = sched.timeZone || 'UTC'
+                    let formatName = ''
+                    let timeShown = ''
+                    const srec: Record<string, unknown> = sched as unknown as Record<string, unknown>
+                    const useAmPmVal = typeof srec['useAmPm'] === 'boolean' ? (srec['useAmPm'] as boolean) : undefined
+                    const time12Val = typeof srec['time12'] === 'string' ? String(srec['time12']) : undefined
+                    const time24Val = typeof srec['time24'] === 'string' ? String(srec['time24']) : undefined
+
+                    if (useAmPmVal === true) {
+                        formatName = 'AM/PM'
+                        timeShown = time12Val || sched.time || '9:00 AM'
+                    } else if (useAmPmVal === false) {
+                        formatName = '24h'
+                        timeShown = time24Val || sched.time || '09:00'
+                    } else {
+                        // Back-compat: infer from provided fields if possible
+                        if (time24Val && time24Val.trim()) { formatName = '24h'; timeShown = time24Val }
+                        else if (time12Val && time12Val.trim()) { formatName = 'AM/PM'; timeShown = time12Val }
+                        else { formatName = 'legacy'; timeShown = sched.time || '09:00' }
+                    }
+                    console.log(`  Schedule: ON — ${formatName} • ${timeShown} • TZ=${tz}`)
+                }
+            }
+            console.log('='.repeat(80) + '\n')
+    }    
+    
+    // Return summaries (used when clusters==1)
+    public getSummaries() {
+        return this.accountSummaries
+    }
+
+    // private runMaster() {
+    //     log('main', 'MAIN-PRIMARY', 'Primary process started')
+
+    //     // 1. KHỞI TẠO BIẾN THEO DÕI TOÀN CẦU
+    //     const startTime = Date.now() // Bắt đầu tính thời gian chạy tổng thể
+    //     const totalAccounts = this.accounts.length
+    //     let globalCompletedAccounts = 0 // Biến đếm số tài khoản đã hoàn thành trên tất cả các Worker
+        
+    //     // Validate accounts exist
+    //     if (totalAccounts === 0) {
+    //         log('main', 'MAIN-PRIMARY', 'No accounts found to process. Exiting.', 'warn')
+    //         process.exit(0)
+    //     }
+
+    //     // 2. HÀM LẮNG NGHE VÀ XỬ LÝ MESSAGE IPC
+    //     const attachMessageListeners = (worker: Worker) => {
+    //         worker.on('message', (msg: unknown) => {
+    //             const m = msg as { type?: string; data?: any }
+                
+    //             // Xử lý message TÓM TẮT (summary) - Logic cũ
+    //             if (m && m.type === 'summary' && Array.isArray(m.data)) {
+    //                 this.accountSummaries.push(...m.data)
+    //             }
+                
+    //             // Xử lý message TIẾN ĐỘ (progress) - Logic MỚI
+    //             if (m && m.type === 'progress') {
+    //                 globalCompletedAccounts++
+                    
+    //                 // Tính toán và Log Tiến độ TOÀN CẦU
+    //                 const percent = ((globalCompletedAccounts / totalAccounts) * 100).toFixed(1)
+    //                 const elapsed = ((Date.now() - startTime) / 1000).toFixed(1)
+                    
+    //                 log('main', 'GLOBAL-PROGRESS', 
+    //                     `✅ ${globalCompletedAccounts}/${totalAccounts} accounts done (${percent}%) | Time: ${elapsed}s (Worker: ${worker.process.pid})`, 
+    //                     'log', 'cyan')
+                    
+    //                 // Optional: Log chi tiết tài khoản vừa xong
+    //                 if (m.data?.email) {
+    //                     log('main', 'GLOBAL-PROGRESS', 
+    //                         `Account finished: ${m.data.email}`, 
+    //                         'log', 'gray')
+    //                 }
+    //             }
+    //         })
+    //     }
+        
+    //     // If user over-specified clusters (e.g. 10 clusters but only 2 accounts), don't spawn useless idle workers.
+    //     const workerCount = Math.min(this.config.clusters, totalAccounts)
+    //     const accountChunks = this.utils.chunkArray(this.accounts, workerCount)
+    //     // Reset activeWorkers to actual spawn count (constructor used raw clusters)
+    //     this.activeWorkers = workerCount
+
+    //     for (let i = 0; i < workerCount; i++) {
+    //         const worker = cluster.fork()
+    //         const chunk = accountChunks[i] || []
+            
+    //         // Validate chunk has accounts
+    //         if (chunk.length === 0) {
+    //             log('main', 'MAIN-PRIMARY', `Warning: Worker ${i} received empty account chunk`, 'warn')
+    //         }
+    //         (worker as unknown as { send?: (m: { chunk: Account[] }) => void }).send?.({ chunk })
+    //         // 3. GẮN HÀM LẮNG NGHE VÀO WORKER MỚI
+    //         attachMessageListeners(worker)
+            
+    //     }
+
+    //     cluster.on('exit', (worker: Worker, code: number) => {
+    //         this.activeWorkers -= 1
+
+    //         log('main', 'MAIN-WORKER', `Worker ${worker.process.pid} destroyed | Code: ${code} | Active workers: ${this.activeWorkers}`, 'warn')
+
+    //         // Optional: restart crashed worker (basic heuristic) if crashRecovery allows
+    //         try {
+    //             const cr = this.config.crashRecovery
+    //             if (cr?.restartFailedWorker && code !== 0) {
+    //                 const attempts = (worker as unknown as { _restartAttempts?: number })._restartAttempts || 0
+    //                 if (attempts < (cr.restartFailedWorkerAttempts ?? 1)) {
+    //                     (worker as unknown as { _restartAttempts?: number })._restartAttempts = attempts + 1
+    //                     log('main','CRASH-RECOVERY',`Respawning worker (attempt ${attempts + 1})`, 'warn','yellow')
+    //                     const newW = cluster.fork()
+    //                     // 3. GẮN HÀM LẮNG NGHE VÀ WORKER RESPPAWN
+    //                     attachMessageListeners(newW) 
+    //                     // NOTE: account chunk re-assignment simplistic: unused; real mapping improvement todo
+    //                     // Vì Worker mới không có chunk cũ, bạn cần cải thiện logic này sau. Hiện tại chỉ gắn message listener.
+    //                 }
+    //             }
+    //         } catch { /* ignore */ }
+
+    //         // Check if all workers have exited
+    //         if (this.activeWorkers === 0) {
+    //             // ... (Phần còn lại của logic kết thúc giữ nguyên)
+    //             (async () => {
+    //                 try {
+    //                     await this.sendConclusion(this.accountSummaries)
+    //                 } catch {/* ignore */}
+    //                 try {
+    //                     await this.runAutoUpdate()
+    //                 } catch {/* ignore */}
+    //                 // Only exit if not spawned by scheduler
+    //                 if (!process.env.SCHEDULER_HEARTBEAT_FILE) {
+    //                     log('main', 'MAIN-WORKER', 'All workers destroyed. Exiting main process!', 'warn')
+    //                     process.exit(0)
+    //                 } else {
+    //                     log('main', 'MAIN-WORKER', 'All workers destroyed. Scheduler mode: returning control to scheduler.')
+    //                 }
+    //             })()
+    //         }
+    //     })
+    // }
+
+    // runMaster2()
+    private runMaster2() {
+        log('main', 'MAIN-PRIMARY', 'Primary process started')
+
+        // KHỞI TẠO HÀNG ĐỢI VÀ BIẾN THEO DÕI TOÀN CẦU
+        const startTime = Date.now()
+        const totalAccounts = this.accounts.length
+        // Tạo hàng đợi tài khoản (Mutable Queue)
+        const accountsToProcess: Account[] = [...this.accounts] 
+        let globalCompletedAccounts = 0
+        
+        // Validate accounts exist
+        if (totalAccounts === 0) {
+            log('main', 'MAIN-PRIMARY', 'No accounts found to process. Exiting.', 'warn')
+            process.exit(0)
+        }
+        
+        // HÀM PHÂN PHÁT NHIỆM VỤ ĐỘNG
+        const sendNextTask = (worker: Worker) => {
+            if (accountsToProcess.length > 0) {
+                const account = accountsToProcess.shift()!; // Lấy tài khoản tiếp theo
+                
+                // Gửi CHỈ MỘT tài khoản tới Worker
+                // Sử dụng key 'account' để Worker biết đó là một nhiệm vụ mới
+                (worker as unknown as { send?: (m: { account: Account }) => void }).send?.({ account }) 
+                
+                log('main', 'DISPATCH', 
+                    `Worker ${worker.process.pid} received task for ${account.email}. Queue left: ${accountsToProcess.length}/${totalAccounts}`, 
+                    'log', 'magenta')
+            } else {
+                // Không còn tài khoản, gửi tín hiệu thoát an toàn
+                (worker as unknown as { send?: (m: { no_more_tasks: boolean }) => void }).send?.({ no_more_tasks: true })
+                log('main', 'DISPATCH', `No more tasks. Worker ${worker.process.pid} instructed to exit.`, 'log', 'gray')
+            }
+        }
+
+        // HÀM LẮNG NGHE VÀ XỬ LÝ MESSAGE IPC
+        const attachMessageListeners = (worker: Worker) => {
+            worker.on('message', (msg: unknown) => {
+                const m = msg as { type?: string; data?: any }
+                
+                if (m && m.type === 'summary' && Array.isArray(m.data)) {
+                    // Thu thập summary cuối cùng (Worker sẽ gửi summary khi nhận tín hiệu no_more_tasks)
+                    this.accountSummaries.push(...m.data)
+                }
+                
+                // LOGIC QUAN TRỌNG: Worker báo cáo hoàn thành task và sẵn sàng nhận task mới
+                if (m && m.type === 'task_completed') {
+                    globalCompletedAccounts++
+                    
+                    // Cập nhật và Log Tiến độ TOÀN CẦU
+                    const percent = ((globalCompletedAccounts / totalAccounts) * 100).toFixed(1)
+                    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1)
+                    
+                    log('main', 'GLOBAL-PROGRESS', 
+                        `✅ ${globalCompletedAccounts}/${totalAccounts} accounts done (${percent}%) | Time: ${elapsed}s (Worker: ${worker.process.pid})`, 
+                        'log', 'cyan')
+                    
+                    // ✅ Gửi nhiệm vụ tiếp theo ngay lập tức cho Worker vừa xong
+                    sendNextTask(worker)
+                }
+            })
+        }
+        
+        // Nếu người dùng chỉ định clusters lớn hơn số tài khoản, ta chỉ tạo số Worker bằng số tài khoản
+        const workerCount = Math.min(this.config.clusters, totalAccounts)
+        this.activeWorkers = workerCount
+
+        for (let i = 0; i < workerCount; i++) {
+            const worker = cluster.fork()
+            
+            attachMessageListeners(worker) 
+            
+            // Gửi tài khoản ĐẦU TIÊN để Worker bắt đầu làm việc
+            sendNextTask(worker)
+            
+            // NOTE: Đã loại bỏ logic gửi chunk cũ ở đây
+        }
+
+        // Xử lý Worker thoát/Crash (Giữ nguyên logic exit, nhưng đảm bảo listener được gắn)
+        cluster.on('exit', (worker: Worker, code: number) => {
+            this.activeWorkers -= 1
+
+            log('main', 'MAIN-WORKER', `Worker ${worker.process.pid} destroyed | Code: ${code} | Active workers: ${this.activeWorkers}`, 'warn')
+
+            // Logic Crash Recovery
+            try {
+                const cr = this.config.crashRecovery
+                if (cr?.restartFailedWorker && code !== 0) {
+                    const attempts = (worker as unknown as { _restartAttempts?: number })._restartAttempts || 0
+                    if (attempts < (cr.restartFailedWorkerAttempts ?? 1)) {
+                        (worker as unknown as { _restartAttempts?: number })._restartAttempts = attempts + 1
+                        log('main','CRASH-RECOVERY',`Respawning worker (attempt ${attempts + 1})`, 'warn','yellow')
+                        const newW = cluster.fork()
+                        attachMessageListeners(newW) 
+                        // Gửi task đến Worker Respawn (nếu còn task)
+                        sendNextTask(newW) 
+                    }
+                }
+            } catch { /* ignore */ }
+
+            // Logic kết thúc (Chỉ khi tất cả Worker thoát)
+            if (this.activeWorkers === 0) {
+                (async () => {
+                    try {
+                        await this.sendConclusion(this.accountSummaries)
+                    } catch {/* ignore */}
+                    try {
+                        await this.runAutoUpdate()
+                    } catch {/* ignore */}
+                    if (!process.env.SCHEDULER_HEARTBEAT_FILE) {
+                        log('main', 'MAIN-WORKER', 'All workers destroyed. Exiting main process!', 'warn')
+                        process.exit(0)
+                    } else {
+                        log('main', 'MAIN-WORKER', 'All workers destroyed. Scheduler mode: returning control to scheduler.')
+                    }
+                })()
+            }
+        })
+    }
+
+    // private runWorker() {
+    //     log('main', 'MAIN-WORKER', `Worker ${process.pid} spawned`)
+    //     // Receive the chunk of accounts from the master
+    // ;(process as unknown as { on: (ev: 'message', cb: (m: { chunk: Account[] }) => void) => void }).on('message', async ({ chunk }: { chunk: Account[] }) => {
+    //         await this.runTasks(chunk)
+    //     })
+    // }
+
+    // runWorker2()
+    private async runWorker2() {
+        log('main', 'MAIN-WORKER', 'Worker process started. Awaiting task assignment from Master...');
+
+        // Lắng nghe tin nhắn từ Master
+        process.on('message', async (msg: unknown) => {
+            const m = msg as { account?: Account, no_more_tasks?: boolean };
+            
+            // 1. Tín hiệu thoát (Hoàn thành tất cả 13 tài khoản)
+            if (m.no_more_tasks) {
+                await log(false, 'MAIN-WORKER', 'Received no_more_tasks signal. Sending summary and exiting...', 'warn');
+                
+                // Gửi TÓM TẮT cuối cùng về Master trước khi thoát
+                if (this.accountSummaries.length > 0 && process.send) {
+                    process.send({ type: 'summary', data: this.accountSummaries });
+                }
+                
+                // Cleanup và thoát
+                if (this.heartbeatTimer) { try { clearInterval(this.heartbeatTimer) } catch { /* ignore */ } }
+                process.exit(0); 
+                return;
+            }
+
+            // 2. Nhận nhiệm vụ mới
+            if (m.account) {
+                // Xử lý tài khoản
+                try {
+                    await this.processSingleAccount(m.account); 
+                } catch (e) {
+                    log(false, 'TASK', `Error processing account ${m.account.email}: ${e instanceof Error ? e.message : String(e)}`, 'error');
+                    
+                    // QUAN TRỌNG: Nếu lỗi, vẫn báo completed để Master gửi task mới
+                    if (process.send) {
+                        process.send({ type: 'task_completed', data: { email: m.account.email, error: true } });
+                    }
+                }
+            }
+        });
+
+        // Rất quan trọng: Ngăn Worker process thoát ngay lập tức. Nó phải chờ tin nhắn IPC.
+        await new Promise<void>(() => {}); 
+    }
+
+    private async runTasks(accounts: Account[]) {
+        // EDIT START
+        let completed = 0 // ✅ Biến đếm tiến độ
+        const total = accounts.length
+        const startTime = Date.now()
+        // EDIT END
+        for (const account of accounts) {
+            // If a global standby is active due to security/banned, stop processing further accounts
+            if (this.globalStandby.active) {
+                log('main','SECURITY',`Global standby active (${this.globalStandby.reason || 'security-issue'}). Not proceeding to next accounts until resolved.`, 'warn', 'yellow')
+                break
+            }
+            // Optional global stop after first ban
+            if (this.config?.humanization?.stopOnBan === true && this.bannedTriggered) {
+                log('main','TASK',`Stopping remaining accounts due to ban on ${this.bannedTriggered.email}: ${this.bannedTriggered.reason}`,'warn')
+                break
+            }
+            // Reset compromised state per account
+            this.compromisedModeActive = false
+            this.compromisedReason = undefined
+            this.compromisedEmail = undefined
+            // If humanization allowed windows are configured, wait until within a window
+            try {
+                const windows: string[] | undefined = this.config?.humanization?.allowedWindows
+                if (Array.isArray(windows) && windows.length > 0) {
+                    const waitMs = this.computeWaitForAllowedWindow(windows)
+                    if (waitMs > 0) {
+                        log('main','HUMANIZATION',`Waiting ${Math.ceil(waitMs/1000)}s until next allowed window before starting ${account.email}`,'warn')
+                        await new Promise<void>(r => setTimeout(r, waitMs))
+                    }
+                }
+            } catch {/* ignore */}
+            this.currentAccountEmail = account.email
+            this.currentAccountRecoveryEmail = account.recoveryEmail
+            log('main', 'MAIN-WORKER', `Started tasks for account ${account.email}`)
+
+            const accountStart = Date.now()
+            let desktopInitial = 0
+            let mobileInitial = 0
+            let desktopCollected = 0
+            let mobileCollected = 0
+            const errors: string[] = []
+            const banned = { status: false, reason: '' }
+
+            this.axios = new Axios(account.proxy)
+            const verbose = process.env.DEBUG_REWARDS_VERBOSE === '1'
+            const formatFullErr = (label: string, e: unknown) => {
+                const base = shortErr(e)
+                if (verbose && e instanceof Error) {
+                    return `${label}:${base} :: ${e.stack?.split('\n').slice(0,4).join(' | ')}`
+                }
+                return `${label}:${base}`
+            }
+
+            if (this.config.parallel) {
+                const mobileInstance = new MicrosoftRewardsBot(true)
+                mobileInstance.axios = this.axios
+                // Run both and capture results with detailed logging
+                const desktopPromise = this.Desktop(account).catch(e => {
+                    const msg = e instanceof Error ? e.message : String(e)
+                    log(false, 'TASK', `Desktop flow failed early for ${account.email}: ${msg}`,'error')
+                    const bd = detectBanReason(e)
+                    if (bd.status) {
+                        banned.status = true; banned.reason = bd.reason.substring(0,200)
+                        void this.handleImmediateBanAlert(account.email, banned.reason)
+                    }
+                    errors.push(formatFullErr('desktop', e)); return null
+                })
+                const mobilePromise = mobileInstance.Mobile(account).catch(e => {
+                    const msg = e instanceof Error ? e.message : String(e)
+                    log(true, 'TASK', `Mobile flow failed early for ${account.email}: ${msg}`,'error')
+                    const bd = detectBanReason(e)
+                    if (bd.status) {
+                        banned.status = true; banned.reason = bd.reason.substring(0,200)
+                        void this.handleImmediateBanAlert(account.email, banned.reason)
+                    }
+                    errors.push(formatFullErr('mobile', e)); return null
+                })
+                const [desktopResult, mobileResult] = await Promise.allSettled([desktopPromise, mobilePromise])
+                
+                // Handle desktop result
+                if (desktopResult.status === 'fulfilled' && desktopResult.value) {
+                    desktopInitial = desktopResult.value.initialPoints
+                    desktopCollected = desktopResult.value.collectedPoints
+                } else if (desktopResult.status === 'rejected') {
+                    log(false, 'TASK', `Desktop promise rejected unexpectedly: ${shortErr(desktopResult.reason)}`,'error')
+                    errors.push(formatFullErr('desktop-rejected', desktopResult.reason))
+                }
+                
+                // Handle mobile result
+                if (mobileResult.status === 'fulfilled' && mobileResult.value) {
+                    mobileInitial = mobileResult.value.initialPoints
+                    mobileCollected = mobileResult.value.collectedPoints
+                } else if (mobileResult.status === 'rejected') {
+                    log(true, 'TASK', `Mobile promise rejected unexpectedly: ${shortErr(mobileResult.reason)}`,'error')
+                    errors.push(formatFullErr('mobile-rejected', mobileResult.reason))
+                }
+            } else {
+                // Sequential execution with safety checks
+                if (this.isDesktopRunning || this.isMobileRunning) {
+                    log('main', 'TASK', `Race condition detected: Desktop=${this.isDesktopRunning}, Mobile=${this.isMobileRunning}. Skipping to prevent conflicts.`, 'error')
+                    errors.push('race-condition-detected')
+                } else {
+                    this.isMobile = false
+                    this.isDesktopRunning = true
+                    const desktopResult = await this.Desktop(account).catch(e => {
+                        const msg = e instanceof Error ? e.message : String(e)
+                        log(false, 'TASK', `Desktop flow failed early for ${account.email}: ${msg}`,'error')
+                        const bd = detectBanReason(e)
+                        if (bd.status) {
+                            banned.status = true; banned.reason = bd.reason.substring(0,200)
+                            void this.handleImmediateBanAlert(account.email, banned.reason)
+                        }
+                        errors.push(formatFullErr('desktop', e)); return null
+                    })
+                    if (desktopResult) {
+                        desktopInitial = desktopResult.initialPoints
+                        desktopCollected = desktopResult.collectedPoints
+                    }
+                    this.isDesktopRunning = false
+
+                    // If banned or compromised detected, skip mobile to save time
+                    if (!banned.status && !this.compromisedModeActive) {
+                        this.isMobile = true
+                        this.isMobileRunning = true
+                        const mobileResult = await this.Mobile(account).catch(e => {
+                            const msg = e instanceof Error ? e.message : String(e)
+                            log(true, 'TASK', `Mobile flow failed early for ${account.email}: ${msg}`,'error')
+                            const bd = detectBanReason(e)
+                            if (bd.status) {
+                                banned.status = true; banned.reason = bd.reason.substring(0,200)
+                                void this.handleImmediateBanAlert(account.email, banned.reason)
+                            }
+                            errors.push(formatFullErr('mobile', e)); return null
+                        })
+                        if (mobileResult) {
+                            mobileInitial = mobileResult.initialPoints
+                            mobileCollected = mobileResult.collectedPoints
+                        }
+                        this.isMobileRunning = false
+                    } else {
+                        const why = banned.status ? 'banned status' : 'compromised status'
+                        log(true, 'TASK', `Skipping mobile flow for ${account.email} due to ${why}`, 'warn')
+                    }
+                }
+            }
+
+            const accountEnd = Date.now()
+            const durationMs = accountEnd - accountStart
+            const totalCollected = desktopCollected + mobileCollected
+            // Correct initial points (previous version double counted desktop+mobile baselines)
+            // Strategy: pick the lowest non-zero baseline (desktopInitial or mobileInitial) as true start.
+            // Sequential flow: desktopInitial < mobileInitial after gain -> min = original baseline.
+            // Parallel flow: both baselines equal -> min is fine.
+            const baselines: number[] = []
+            if (desktopInitial) baselines.push(desktopInitial)
+            if (mobileInitial) baselines.push(mobileInitial)
+            let initialTotal = 0
+            if (baselines.length === 1) initialTotal = baselines[0]!
+            else if (baselines.length === 2) initialTotal = Math.min(baselines[0]!, baselines[1]!)
+            // Fallback if both missing
+            if (initialTotal === 0 && (desktopInitial || mobileInitial)) initialTotal = desktopInitial || mobileInitial || 0
+            const endTotal = initialTotal + totalCollected
+            this.accountSummaries.push({
+                email: account.email,
+                durationMs,
+                desktopCollected,
+                mobileCollected,
+                totalCollected,
+                initialTotal,
+                endTotal,
+                errors,
+                banned
+            })
+
+            if (banned.status) {
+                this.bannedTriggered = { email: account.email, reason: banned.reason }
+                // Enter global standby: do not proceed to next accounts
+                this.globalStandby = { active: true, reason: `banned:${banned.reason}` }
+                await this.sendGlobalSecurityStandbyAlert(account.email, `Ban detected: ${banned.reason || 'unknown'}`)
+            }
+            // EDIT ✅ Cập nhật tiến độ realtime
+            completed++
+            if (this.config.clusters > 1 && process.send) {
+                 // Chế độ Worker (clusters > 1): Gửi tín hiệu IPC lên Master
+                process.send({ type: 'progress', data: { email: account.email } })
+            } else {
+                const percent = ((completed / total) * 100).toFixed(1)
+                const elapsed = ((Date.now() - startTime) / 1000).toFixed(1)
+                log('main', 'PROGRESS', `✅ ${completed}/${total} accounts done (${percent}%) | Time: ${elapsed}s`, 'log', 'cyan')
+            }
+            // EDIT END
+            await log('main', 'MAIN-WORKER', `Completed tasks for account ${account.email}`, 'log', 'green')
+        }
+
+        await log(this.isMobile, 'MAIN-PRIMARY', 'Completed tasks for ALL accounts', 'log', 'green')
+
+        // Extra diagnostic summary when verbose
+        if (process.env.DEBUG_REWARDS_VERBOSE === '1') {
+            for (const summary of this.accountSummaries) {
+                log('main','SUMMARY-DEBUG',`Account ${summary.email} collected D:${summary.desktopCollected} M:${summary.mobileCollected} TOTAL:${summary.totalCollected} ERRORS:${summary.errors.length ? summary.errors.join(';') : 'none'}`)
+            }
+        }
+        // If any account is flagged compromised, do NOT exit; keep the process alive so the browser stays open
+        if (this.compromisedModeActive || this.globalStandby.active) {
+            log('main','SECURITY','Compromised or banned detected. Global standby engaged: we will NOT proceed to other accounts until resolved. Keeping process alive. Press CTRL+C to exit when done. Security check by @Light','warn','yellow')
+            // Periodic heartbeat with cleanup on exit
+            const standbyInterval = setInterval(() => {
+                log('main','SECURITY','Still in standby: session(s) held open for manual recovery / review...','warn','yellow')
+            }, 5 * 60 * 1000)
+            
+            // Cleanup on process exit
+            process.once('SIGINT', () => { clearInterval(standbyInterval); process.exit(0) })
+            process.once('SIGTERM', () => { clearInterval(standbyInterval); process.exit(0) })
+            return
+        }
+        // If in worker mode (clusters>1) send summaries to primary
+        if (this.config.clusters > 1 && !cluster.isPrimary) {
+            if (process.send) {
+                process.send({ type: 'summary', data: this.accountSummaries })
+            }
+        } else {
+            // Single process mode -> build and send conclusion directly
+            await this.sendConclusion(this.accountSummaries)
+            // Cleanup heartbeat timer/file at end of run
+            if (this.heartbeatTimer) { try { clearInterval(this.heartbeatTimer) } catch { /* ignore */ } }
+            if (this.heartbeatFile) { try { if (fs.existsSync(this.heartbeatFile)) fs.unlinkSync(this.heartbeatFile) } catch { /* ignore */ } }
+            // After conclusion, run optional auto-update
+            await this.runAutoUpdate().catch(() => {/* ignore update errors */})
+        }
+        // Only exit if not spawned by scheduler
+        if (!process.env.SCHEDULER_HEARTBEAT_FILE) {
+            process.exit()
+        }
+    }
+
+    // Thêm phương thức này vào class MicrosoftRewardsBot của bạn
+    private async processSingleAccount(account: Account): Promise<AccountSummary> {
+        
+        // Khởi tạo một đối tượng summary rỗng (sẽ được điền vào)
+        let summary: AccountSummary = {
+            email: account.email,
+            durationMs: 0,
+            desktopCollected: 0,
+            mobileCollected: 0,
+            totalCollected: 0,
+            initialTotal: 0,
+            endTotal: 0,
+            errors: [],
+            banned: { status: false, reason: '' }
+        };
+
+        // 1. Logic Kiểm tra An toàn và Dừng (Thay thế 'break' bằng 'return summary')
+        if (this.globalStandby.active) {
+            log('main','SECURITY',`Global standby active (${this.globalStandby.reason || 'security-issue'}). Skipping account ${account.email}.`, 'warn', 'yellow');
+            return summary; // Trả về summary rỗng
+        }
+        if (this.config?.humanization?.stopOnBan === true && this.bannedTriggered) {
+            log('main','TASK',`Stopping account ${account.email} due to ban on ${this.bannedTriggered.email}: ${this.bannedTriggered.reason}`,'warn');
+            return summary; // Trả về summary rỗng
+        }
+        
+        // 2. Reset trạng thái
+        this.compromisedModeActive = false;
+        this.compromisedReason = undefined;
+        this.compromisedEmail = undefined;
+
+        // 3. Humanization wait logic
+        try {
+            const windows: string[] | undefined = this.config?.humanization?.allowedWindows;
+            if (Array.isArray(windows) && windows.length > 0) {
+                const waitMs = this.computeWaitForAllowedWindow(windows);
+                if (waitMs > 0) {
+                    log('main','HUMANIZATION',`Waiting ${Math.ceil(waitMs/1000)}s until next allowed window before starting ${account.email}`,'warn');
+                    await new Promise<void>(r => setTimeout(r, waitMs));
+                }
+            }
+        } catch {/* ignore */}
+
+        // 4. Thiết lập Context và Biến cục bộ
+        this.currentAccountEmail = account.email;
+        this.currentAccountRecoveryEmail = account.recoveryEmail;
+        log('main', 'MAIN-WORKER', `Started tasks for account ${account.email}`);
+
+        const accountStart = Date.now();
+        let desktopInitial = 0;
+        let mobileInitial = 0;
+        let desktopCollected = 0;
+        let mobileCollected = 0;
+        const errors: string[] = [];
+        const banned = { status: false, reason: '' }; // Dùng biến cục bộ
+
+        this.axios = new Axios(account.proxy);
+        this.queryEngine = this.buildQueryEngine()
+        const verbose = process.env.DEBUG_REWARDS_VERBOSE === '1';
+        
+        // Hàm formatFullErr (Giữ nguyên)
+        const formatFullErr = (label: string, e: unknown) => {
+            const base = shortErr(e); // Giả định shortErr là một hàm có sẵn
+            if (verbose && e instanceof Error) {
+                return `${label}:${base} :: ${e.stack?.split('\n').slice(0,4).join(' | ')}`;
+            }
+            return `${label}:${base}`;
+        };
+
+        // 5. Logic Thực thi (Parallel hoặc Sequential)
+        if (this.config.parallel) {
+            // ... (Giữ nguyên logic Parallel execution) ...
+            const mobileInstance = new MicrosoftRewardsBot(true);
+            mobileInstance.axios = this.axios;
+            mobileInstance.queryEngine = this.queryEngine
+            
+            const desktopPromise = this.Desktop(account).catch(e => {
+                const msg = e instanceof Error ? e.message : String(e);
+                log(false, 'TASK', `Desktop flow failed early for ${account.email}: ${msg}`,'error');
+                const bd = detectBanReason(e); // Giả định detectBanReason là một hàm có sẵn
+                if (bd.status) {
+                    banned.status = true; banned.reason = bd.reason.substring(0,200);
+                    void this.handleImmediateBanAlert(account.email, banned.reason);
+                }
+                errors.push(formatFullErr('desktop', e)); return null;
+            });
+            const mobilePromise = mobileInstance.Mobile(account).catch(e => {
+                const msg = e instanceof Error ? e.message : String(e);
+                log(true, 'TASK', `Mobile flow failed early for ${account.email}: ${msg}`,'error');
+                const bd = detectBanReason(e);
+                if (bd.status) {
+                    banned.status = true; banned.reason = bd.reason.substring(0,200);
+                    void this.handleImmediateBanAlert(account.email, banned.reason);
+                }
+                errors.push(formatFullErr('mobile', e)); return null;
+            });
+            const [desktopResult, mobileResult] = await Promise.allSettled([desktopPromise, mobilePromise]);
+            
+            // Handle desktop result
+            if (desktopResult.status === 'fulfilled' && desktopResult.value) {
+                desktopInitial = desktopResult.value.initialPoints;
+                desktopCollected = desktopResult.value.collectedPoints;
+            } else if (desktopResult.status === 'rejected') {
+                log(false, 'TASK', `Desktop promise rejected unexpectedly: ${shortErr(desktopResult.reason)}`,'error');
+                errors.push(formatFullErr('desktop-rejected', desktopResult.reason));
+            }
+            
+            // Handle mobile result
+            if (mobileResult.status === 'fulfilled' && mobileResult.value) {
+                mobileInitial = mobileResult.value.initialPoints;
+                mobileCollected = mobileResult.value.collectedPoints;
+            } else if (mobileResult.status === 'rejected') {
+                log(true, 'TASK', `Mobile promise rejected unexpectedly: ${shortErr(mobileResult.reason)}`,'error');
+                errors.push(formatFullErr('mobile-rejected', mobileResult.reason));
+            }
+        } else {
+            // Sequential execution (Giữ nguyên logic Sequential execution)
+            if (this.isDesktopRunning || this.isMobileRunning) {
+                log('main', 'TASK', `Race condition detected: Desktop=${this.isDesktopRunning}, Mobile=${this.isMobileRunning}. Skipping to prevent conflicts.`, 'error');
+                errors.push('race-condition-detected');
+            } else {
+                this.isMobile = false;
+                this.isDesktopRunning = true;
+                const desktopResult = await this.Desktop(account).catch(e => {
+                    const msg = e instanceof Error ? e.message : String(e);
+                    log(false, 'TASK', `Desktop flow failed early for ${account.email}: ${msg}`,'error');
+                    const bd = detectBanReason(e);
+                    if (bd.status) {
+                        banned.status = true; banned.reason = bd.reason.substring(0,200);
+                        void this.handleImmediateBanAlert(account.email, banned.reason);
+                    }
+                    errors.push(formatFullErr('desktop', e)); return null;
+                });
+                if (desktopResult) {
+                    desktopInitial = desktopResult.initialPoints;
+                    desktopCollected = desktopResult.collectedPoints;
+                }
+                this.isDesktopRunning = false;
+
+                if (!banned.status && !this.compromisedModeActive) {
+                    this.isMobile = true;
+                    this.isMobileRunning = true;
+                    const mobileResult = await this.Mobile(account).catch(e => {
+                        const msg = e instanceof Error ? e.message : String(e);
+                        log(true, 'TASK', `Mobile flow failed early for ${account.email}: ${msg}`,'error');
+                        const bd = detectBanReason(e);
+                        if (bd.status) {
+                            banned.status = true; banned.reason = bd.reason.substring(0,200);
+                            void this.handleImmediateBanAlert(account.email, banned.reason);
+                        }
+                        errors.push(formatFullErr('mobile', e)); return null;
+                    });
+                    if (mobileResult) {
+                        mobileInitial = mobileResult.initialPoints;
+                        mobileCollected = mobileResult.collectedPoints;
+                    }
+                    this.isMobileRunning = false;
+                } else {
+                    const why = banned.status ? 'banned status' : 'compromised status';
+                    log(true, 'TASK', `Skipping mobile flow for ${account.email} due to ${why}`, 'warn');
+                }
+            }
+        }
+
+        // 6. Tính toán Summary (Giữ nguyên)
+        const accountEnd = Date.now();
+        const durationMs = accountEnd - accountStart;
+        const totalCollected = desktopCollected + mobileCollected;
+        
+        const baselines: number[] = [];
+        if (desktopInitial) baselines.push(desktopInitial);
+        if (mobileInitial) baselines.push(mobileInitial);
+        let initialTotal = 0;
+        if (baselines.length === 1) initialTotal = baselines[0]!;
+        else if (baselines.length === 2) initialTotal = Math.min(baselines[0]!, baselines[1]!);
+        if (initialTotal === 0 && (desktopInitial || mobileInitial)) initialTotal = desktopInitial || mobileInitial || 0;
+        const endTotal = initialTotal + totalCollected;
+        
+        // Cập nhật đối tượng Summary
+        summary = {
+            email: account.email,
+            durationMs,
+            desktopCollected,
+            mobileCollected,
+            totalCollected,
+            initialTotal,
+            endTotal,
+            errors,
+            banned
+        };
+
+        // 7. Xử lý Ban/Standby (Giữ nguyên)
+        if (banned.status) {
+            this.bannedTriggered = { email: account.email, reason: banned.reason };
+            this.globalStandby = { active: true, reason: `banned:${banned.reason}` };
+            await this.sendGlobalSecurityStandbyAlert(account.email, `Ban detected: ${banned.reason || 'unknown'}`);
+        }
+        
+        // ⭐️ Ghi summary vào Worker's array (Sẽ được gửi cho Master khi Worker thoát)
+        this.accountSummaries.push(summary);
+        
+        // ⭐️ BÁO CÁO HOÀN THÀNH VÀ SẴN SÀNG (IPC)
+        if (this.config.clusters > 1 && process.send) {
+            // Gửi tín hiệu task_completed (Sẵn sàng nhận task mới)
+            process.send({ type: 'task_completed', data: { email: account.email } });
+        }
+        
+        await log('main', 'MAIN-WORKER', `Completed tasks for account ${account.email}`, 'log', 'green');
+        
+        return summary;
+    }
+
+    /** Send immediate ban alert if configured. */
+    private async handleImmediateBanAlert(email: string, reason: string): Promise<void> {
+        try {
+            const h = this.config?.humanization
+            if (!h || h.immediateBanAlert === false) return
+            const { ConclusionWebhook } = await import('./util/ConclusionWebhook')
+            await ConclusionWebhook(
+                this.config,
+                '🚫 Ban Detected',
+                `**Account:** ${email}\n**Reason:** ${reason || 'detected by heuristics'}`,
+                undefined,
+                DISCORD.COLOR_RED
+            )
+        } catch (e) {
+            log('main','ALERT',`Failed to send ban alert: ${e instanceof Error ? e.message : e}`,'warn')
+        }
+    }
+
+    /**
+     * Compute milliseconds to wait until within one of the allowed windows (HH:mm-HH:mm).
+     * IMPROVED: Better documentation and validation
+     * 
+     * @param windows - Array of time window strings in format "HH:mm-HH:mm"
+     * @returns Milliseconds to wait (0 if already inside a window)
+     * 
+     * @example
+     * computeWaitForAllowedWindow(['09:00-17:00']) // Wait until 9 AM if outside window
+     * computeWaitForAllowedWindow(['22:00-02:00']) // Handles midnight crossing
+     */
+    private computeWaitForAllowedWindow(windows: string[]): number {
+        const now = new Date()
+        const minsNow = now.getHours() * 60 + now.getMinutes()
+        let nextStartMins: number | null = null
+
+        for (const w of windows) {
+            const [start, end] = w.split('-')
+            if (!start || !end) continue
+
+            const pStart = start.split(':').map(v => parseInt(v, 10))
+            const pEnd = end.split(':').map(v => parseInt(v, 10))
+            if (pStart.length !== 2 || pEnd.length !== 2) continue
+
+            const sh = pStart[0]!, sm = pStart[1]!
+            const eh = pEnd[0]!, em = pEnd[1]!
+
+            // Validate hours and minutes ranges
+            if ([sh, sm, eh, em].some(n => Number.isNaN(n))) continue
+            if (sh < 0 || sh > 23 || eh < 0 || eh > 23) continue
+            if (sm < 0 || sm > 59 || em < 0 || em > 59) continue
+
+            const s = sh * 60 + sm
+            const e = eh * 60 + em
+
+            if (s <= e) {
+                // Same-day window (e.g., 09:00-17:00)
+                if (minsNow >= s && minsNow <= e) return 0
+                if (minsNow < s) nextStartMins = Math.min(nextStartMins ?? s, s)
+            } else {
+                // Wraps past midnight (e.g., 22:00-02:00)
+                if (minsNow >= s || minsNow <= e) return 0
+                nextStartMins = Math.min(nextStartMins ?? s, s)
+            }
+        }
+
+        const msPerMin = 60 * 1000
+        if (nextStartMins != null) {
+            const targetTodayMs = (nextStartMins - minsNow) * msPerMin
+            return targetTodayMs > 0 ? targetTodayMs : (24 * 60 + nextStartMins - minsNow) * msPerMin
+        }
+
+        // No valid windows parsed -> do not block
+        return 0
+    }
+
+    // Desktop
+    async Desktop(account: Account) {
+        log(false, 'FLOW', 'Desktop() - delegating to DesktopFlow module')
+        const desktopFlow = new DesktopFlow(this)
+        return await desktopFlow.run(account)
+    }
+
+    async Mobile(
+        account: Account,
+        retryTracker = new MobileRetryTracker(this.config.searchSettings.retryMobileSearchAmount)
+    ): Promise<{ initialPoints: number; collectedPoints: number }> {
+        log(true, 'FLOW', 'Mobile() - delegating to MobileFlow module')
+        const mobileFlow = new MobileFlow(this)
+        return await mobileFlow.run(account, retryTracker)
+    }
+
+
+    private async sendConclusion(summaries: AccountSummary[]) {
+        const { ConclusionWebhookEnhanced } = await import('./util/ConclusionWebhook')
+        const cfg = this.config
+
+    const conclusionWebhookEnabled = !!(cfg.conclusionWebhook && cfg.conclusionWebhook.enabled)
+    const ntfyEnabled = !!(cfg.ntfy && cfg.ntfy.enabled)
+    const webhookEnabled = !!(cfg.webhook && cfg.webhook.enabled)
+
+        const totalAccounts = summaries.length
+        if (totalAccounts === 0) return
+
+        let totalCollected = 0
+        let totalInitial = 0
+        let totalEnd = 0
+        let totalDuration = 0
+        let accountsWithErrors = 0
+        let accountsBanned = 0
+        let successes = 0
+
+        // Calculate summary statistics
+        for (const s of summaries) {
+            totalCollected += s.totalCollected
+            totalInitial += s.initialTotal
+            totalEnd += s.endTotal
+            totalDuration += s.durationMs
+            if (s.banned?.status) accountsBanned++
+            if (s.errors.length) accountsWithErrors++
+            if (!s.banned?.status && !s.errors.length) successes++
+        }
+
+        const avgDuration = totalDuration / totalAccounts
+        const avgPointsPerAccount = Math.round(totalCollected / totalAccounts)
+
+        // Read package version
+        let version = 'unknown'
+        try {
+            const pkgPath = path.join(process.cwd(), 'package.json')
+            if (fs.existsSync(pkgPath)) {
+                const raw = fs.readFileSync(pkgPath, 'utf-8')
+                const pkg = JSON.parse(raw)
+                version = pkg.version || version
+            }
+        } catch { /* ignore */ }
+
+        // Send enhanced webhook
+        if (conclusionWebhookEnabled || ntfyEnabled || webhookEnabled) {
+            await ConclusionWebhookEnhanced(cfg, {
+                version,
+                runId: this.runId,
+                totalAccounts,
+                successes,
+                accountsWithErrors,
+                accountsBanned,
+                totalCollected,
+                totalInitial,
+                totalEnd,
+                avgPointsPerAccount,
+                totalDuration,
+                avgDuration,
+                summaries
+            })
+        }
+
+        // Write local JSON report
+        try {
+            const fs = await import('fs')
+            const path = await import('path')
+            const now = new Date()
+            const day = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`
+            const baseDir = path.join(process.cwd(), 'reports', day)
+            if (!fs.existsSync(baseDir)) fs.mkdirSync(baseDir, { recursive: true })
+            const file = path.join(baseDir, `summary_${this.runId}.json`)
+            const payload = {
+                runId: this.runId,
+                timestamp: now.toISOString(),
+                totals: { totalCollected, totalInitial, totalEnd, totalDuration, totalAccounts, accountsWithErrors },
+                perAccount: summaries
+            }
+            fs.writeFileSync(file, JSON.stringify(payload, null, 2), 'utf-8')
+            log('main','REPORT',`Saved report to ${file}`)
+        } catch (e) {
+            log('main','REPORT',`Failed to save report: ${e instanceof Error ? e.message : e}`,'warn')
+        }
+
+        // Cleanup old diagnostics
+        try {
+            const days = cfg.diagnostics?.retentionDays
+            if (typeof days === 'number' && days > 0) {
+                await this.cleanupOldDiagnostics(days)
+            }
+        } catch (e) {
+            log('main','REPORT',`Failed diagnostics cleanup: ${e instanceof Error ? e.message : e}`,'warn')
+        }
+
+        // Optional community notice (shown randomly in ~15% of successful runs)
+        if (Math.random() > 0.85 && successes > 0 && accountsWithErrors === 0) {
+            log('main','INFO','Want faster updates & enhanced anti-detection? Community builds available: https://discord.gg/kn3695Kx32')
+        }
+
+    }
+
+    /** Reserve one diagnostics slot for this run (caps captures). */
+    public tryReserveDiagSlot(maxPerRun: number): boolean {
+        if (this.diagCount >= Math.max(0, maxPerRun || 0)) return false
+        this.diagCount += 1
+        return true
+    }
+
+    /** Delete diagnostics folders older than N days under ./reports */
+    private async cleanupOldDiagnostics(retentionDays: number) {
+        const base = path.join(process.cwd(), 'reports')
+        if (!fs.existsSync(base)) return
+        const entries = fs.readdirSync(base, { withFileTypes: true })
+        const now = Date.now()
+        const keepMs = retentionDays * 24 * 60 * 60 * 1000
+        for (const e of entries) {
+            if (!e.isDirectory()) continue
+            const name = e.name // expect YYYY-MM-DD
+            const parts = name.split('-').map((n: string) => parseInt(n, 10))
+            if (parts.length !== 3 || parts.some(isNaN)) continue
+            const [yy, mm, dd] = parts
+            if (yy === undefined || mm === undefined || dd === undefined) continue
+            const dirDate = new Date(yy, mm - 1, dd).getTime()
+            if (isNaN(dirDate)) continue
+            if (now - dirDate > keepMs) {
+                const dirPath = path.join(base, name)
+                try { fs.rmSync(dirPath, { recursive: true, force: true }) } catch { /* ignore */ }
+            }
+        }
+    }
+
+    // Run optional auto-update script based on configuration flags.
+    private async runAutoUpdate(): Promise<void> {
+        const upd = this.config.update
+        if (!upd) return
+        const scriptRel = upd.scriptPath || 'setup/update/update.mjs'
+        const scriptAbs = path.join(process.cwd(), scriptRel)
+        if (!fs.existsSync(scriptAbs)) return
+
+        const args: string[] = []
+        // Git update is enabled by default (unless explicitly set to false)
+        if (upd.git !== false) args.push('--git')
+        if (upd.docker) args.push('--docker')
+        if (args.length === 0) return
+
+        // Pass scheduler flag to update script so it doesn't exit
+        const isSchedulerMode = !!process.env.SCHEDULER_HEARTBEAT_FILE
+        const env = isSchedulerMode 
+            ? { ...process.env, FROM_SCHEDULER: '1' }
+            : process.env
+
+        await new Promise<void>((resolve) => {
+            const child = spawn(process.execPath, [scriptAbs, ...args], { stdio: 'inherit', env })
+            child.on('close', () => resolve())
+            child.on('error', () => resolve())
+        })
+    }
+
+    /** Public entry-point to engage global security standby from other modules (idempotent). */
+    public async engageGlobalStandby(reason: string, email?: string): Promise<void> {
+        try {
+            if (this.globalStandby.active) return
+            this.globalStandby = { active: true, reason }
+            const who = email || this.currentAccountEmail || 'unknown'
+            await this.sendGlobalSecurityStandbyAlert(who, reason)
+        } catch {/* ignore */}
+    }
+
+    /** Send a strong alert to all channels and mention @everyone when entering global security standby. */
+    private async sendGlobalSecurityStandbyAlert(email: string, reason: string): Promise<void> {
+        try {
+            const { ConclusionWebhook } = await import('./util/ConclusionWebhook')
+            await ConclusionWebhook(
+                this.config,
+                '🚨 Global Security Standby Engaged',
+                `@everyone\n\n**Account:** ${email}\n**Reason:** ${reason}\n**Action:** Pausing all further accounts. We will not proceed until this is resolved.\n\n_Security check by @Light_`,
+                undefined,
+                DISCORD.COLOR_RED
+            )
+        } catch (e) {
+            log('main','ALERT',`Failed to send standby alert: ${e instanceof Error ? e.message : e}`,'warn')
+        }
+    }
+}
+
+interface AccountSummary {
+    email: string
+    durationMs: number
+    desktopCollected: number
+    mobileCollected: number
+    totalCollected: number
+    initialTotal: number
+    endTotal: number
+    errors: string[]
+    banned?: { status: boolean; reason: string }
+}
+
+function shortErr(e: unknown): string {
+    if (e == null) return 'unknown'
+    if (e instanceof Error) return e.message.substring(0, 120)
+    const s = String(e)
+    return s.substring(0, 120)
+}
+
+async function main() {
+    const rewardsBot = new MicrosoftRewardsBot(false)
+
+    const crashState = { restarts: 0 }
+    const config = rewardsBot.config
+
+    const attachHandlers = () => {
+        process.on('unhandledRejection', (reason) => {
+            log('main','FATAL','UnhandledRejection: ' + (reason instanceof Error ? reason.message : String(reason)), 'error')
+            gracefulExit(1)
+        })
+        process.on('uncaughtException', (err) => {
+            log('main','FATAL','UncaughtException: ' + err.message, 'error')
+            gracefulExit(1)
+        })
+        process.on('SIGTERM', () => gracefulExit(0))
+        process.on('SIGINT', () => gracefulExit(0))
+    }
+
+    const gracefulExit = (code: number) => {
+        try { rewardsBot['heartbeatTimer'] && clearInterval(rewardsBot['heartbeatTimer']) } catch { /* ignore */ }
+        if (config?.crashRecovery?.autoRestart && code !== 0) {
+            const max = config.crashRecovery.maxRestarts ?? 2
+            if (crashState.restarts < max) {
+                const backoff = (config.crashRecovery.backoffBaseMs ?? 2000) * (crashState.restarts + 1)
+                log('main','CRASH-RECOVERY',`Scheduling restart in ${backoff}ms (attempt ${crashState.restarts + 1}/${max})`, 'warn','yellow')
+                setTimeout(() => {
+                    crashState.restarts++
+                    bootstrap()
+                }, backoff)
+                return
+            }
+        }
+        process.exit(code)
+    }
+
+    const bootstrap = async () => {
+        try {
+            await rewardsBot.initialize()
+            await rewardsBot.run()
+            
+        } catch (e) {
+            log('main','MAIN-ERROR','Fatal during run: ' + (e instanceof Error ? e.message : e),'error')
+            gracefulExit(1)
+        }
+    }
+
+    attachHandlers()
+    await bootstrap()
+}
+
+// Start the bots
+if (require.main === module) {
+    main().catch(error => {
+        log('main', 'MAIN-ERROR', `Error running bots: ${error}`, 'error')
+        process.exit(1)
+    })
+}

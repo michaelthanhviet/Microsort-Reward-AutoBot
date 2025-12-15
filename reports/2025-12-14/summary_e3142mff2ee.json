@@ -1,0 +1,200 @@
+{
+  "runId": "e3142mff2ee",
+  "timestamp": "2025-12-14T10:02:08.449Z",
+  "totals": {
+    "totalCollected": 121,
+    "totalInitial": 68241,
+    "totalEnd": 68362,
+    "totalDuration": 21313588,
+    "totalAccounts": 13,
+    "accountsWithErrors": 2
+  },
+  "perAccount": [
+    {
+      "email": "nttthuy080995@gmail.com",
+      "durationMs": 74843,
+      "desktopCollected": 5,
+      "mobileCollected": 5,
+      "totalCollected": 10,
+      "initialTotal": 2240,
+      "endTotal": 2250,
+      "errors": [],
+      "banned": {
+        "status": false,
+        "reason": ""
+      }
+    },
+    {
+      "email": "nguyenthithungan28033@gmail.com",
+      "durationMs": 73131,
+      "desktopCollected": 5,
+      "mobileCollected": 5,
+      "totalCollected": 10,
+      "initialTotal": 2519,
+      "endTotal": 2529,
+      "errors": [],
+      "banned": {
+        "status": false,
+        "reason": ""
+      }
+    },
+    {
+      "email": "nguyendinhtrung19x@gmail.com",
+      "durationMs": 2381242,
+      "desktopCollected": 44,
+      "mobileCollected": 0,
+      "totalCollected": 44,
+      "initialTotal": 11462,
+      "endTotal": 11506,
+      "errors": [
+        "mobile:page.goto: net::ERR_CONNECTION_RESET at https://rewards.bing.com/\nCall log:\n\u001b[2m  - navigating to \"https://rewards.bing."
+      ],
+      "banned": {
+        "status": false,
+        "reason": ""
+      }
+    },
+    {
+      "email": "uuwzjup177@outlook.com",
+      "durationMs": 85541,
+      "desktopCollected": 0,
+      "mobileCollected": 0,
+      "totalCollected": 0,
+      "initialTotal": 4999,
+      "endTotal": 4999,
+      "errors": [],
+      "banned": {
+        "status": false,
+        "reason": ""
+      }
+    },
+    {
+      "email": "nguyenthanhviethcmus@outlook.com",
+      "durationMs": 251527,
+      "desktopCollected": 8,
+      "mobileCollected": 8,
+      "totalCollected": 16,
+      "initialTotal": 5827,
+      "endTotal": 5843,
+      "errors": [],
+      "banned": {
+        "status": false,
+        "reason": ""
+      }
+    },
+    {
+      "email": "lethilequyen112019@gmail.com",
+      "durationMs": 78912,
+      "desktopCollected": 5,
+      "mobileCollected": 5,
+      "totalCollected": 10,
+      "initialTotal": 2100,
+      "endTotal": 2110,
+      "errors": [],
+      "banned": {
+        "status": false,
+        "reason": ""
+      }
+    },
+    {
+      "email": "vantranyulgang@gmail.com",
+      "durationMs": 4087116,
+      "desktopCollected": 0,
+      "mobileCollected": 0,
+      "totalCollected": 0,
+      "initialTotal": 754,
+      "endTotal": 754,
+      "errors": [],
+      "banned": {
+        "status": false,
+        "reason": ""
+      }
+    },
+    {
+      "email": "dangkhoa120220@gmail.com",
+      "durationMs": 4260416,
+      "desktopCollected": 5,
+      "mobileCollected": 0,
+      "totalCollected": 5,
+      "initialTotal": 2483,
+      "endTotal": 2488,
+      "errors": [],
+      "banned": {
+        "status": false,
+        "reason": ""
+      }
+    },
+    {
+      "email": "vietnt0695@gmail.com",
+      "durationMs": 76879,
+      "desktopCollected": 5,
+      "mobileCollected": 5,
+      "totalCollected": 10,
+      "initialTotal": 6864,
+      "endTotal": 6874,
+      "errors": [],
+      "banned": {
+        "status": false,
+        "reason": ""
+      }
+    },
+    {
+      "email": "nguyenthuyqueen123@gmail.com",
+      "durationMs": 193582,
+      "desktopCollected": 5,
+      "mobileCollected": 0,
+      "totalCollected": 5,
+      "initialTotal": 7357,
+      "endTotal": 7362,
+      "errors": [
+        "mobile:OAuth code not received within 180s"
+      ],
+      "banned": {
+        "status": false,
+        "reason": ""
+      }
+    },
+    {
+      "email": "xhayah78602@outlook.com",
+      "durationMs": 4711649,
+      "desktopCollected": 0,
+      "mobileCollected": 3,
+      "totalCollected": 3,
+      "initialTotal": 5281,
+      "endTotal": 5284,
+      "errors": [],
+      "banned": {
+        "status": false,
+        "reason": ""
+      }
+    },
+    {
+      "email": "michaelthanhviet@outlook.com",
+      "durationMs": 56399,
+      "desktopCollected": 0,
+      "mobileCollected": 0,
+      "totalCollected": 0,
+      "initialTotal": 4785,
+      "endTotal": 4785,
+      "errors": [],
+      "banned": {
+        "status": false,
+        "reason": ""
+      }
+    },
+    {
+      "email": "nguyenkhoa120399@gmail.com",
+      "durationMs": 4982351,
+      "desktopCollected": 5,
+      "mobileCollected": 3,
+      "totalCollected": 8,
+      "initialTotal": 11570,
+      "endTotal": 11578,
+      "errors": [],
+      "banned": {
+        "status": false,
+        "reason": ""
+      }
+    }
+  ]
+}
