@@ -20,6 +20,7 @@ import { handleCompromisedMode } from './util/FlowUtils'
 export interface MobileFlowResult {
     initialPoints: number
     collectedPoints: number
+    currentPoints: number
 }
 
 export class MobileFlow {
@@ -76,7 +77,7 @@ export class MobileFlow {
                 const reason = this.bot.compromisedReason || 'security-issue'
                 const result = await handleCompromisedMode(this.bot, account.email, reason, true)
                 keepBrowserOpen = result.keepBrowserOpen
-                return { initialPoints: 0, collectedPoints: 0 }
+                return { initialPoints: 0, collectedPoints: 0, currentPoints: 0 }
             }
 
             const accessToken = await this.bot.login.getMobileAccessToken(this.bot.homePage, account.email, account.totp)
@@ -109,7 +110,8 @@ export class MobileFlow {
 
                 return {
                     initialPoints: safeInitialPoints,
-                    collectedPoints: 0
+                    collectedPoints: 0, 
+                    currentPoints: 0
                 }
             }
 
@@ -178,7 +180,8 @@ export class MobileFlow {
 
             return {
                 initialPoints: safeInitialPoints,
-                collectedPoints: (afterPointAmount - safeInitialPoints) || 0
+                collectedPoints: (afterPointAmount - safeInitialPoints) || 0,
+                currentPoints: afterPointAmount
             }
         } finally {
             if (!keepBrowserOpen && !browserClosed) {

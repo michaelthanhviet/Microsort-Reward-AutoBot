@@ -18,6 +18,7 @@ import { handleCompromisedMode } from './util/FlowUtils'
 export interface DesktopFlowResult {
     initialPoints: number
     collectedPoints: number
+    currentPoints: number
 }
 
 export class DesktopFlow {
@@ -69,7 +70,7 @@ export class DesktopFlow {
                 const reason = this.bot.compromisedReason || 'security-issue'
                 const result = await handleCompromisedMode(this.bot, account.email, reason, false)
                 keepBrowserOpen = result.keepBrowserOpen
-                return { initialPoints: 0, collectedPoints: 0 }
+                return { initialPoints: 0, collectedPoints: 0 , currentPoints: 0}
             }
 
             await this.bot.browser.func.goHome(this.bot.homePage)
@@ -98,7 +99,7 @@ export class DesktopFlow {
             // If runOnZeroPoints is false and 0 points to earn, don't continue
             if (!this.bot.config.runOnZeroPoints && pointsCanCollect === 0) {
                 this.bot.log(false, 'DESKTOP-FLOW', 'No points to earn and "runOnZeroPoints" is set to "false", stopping!', 'log', 'yellow')
-                return { initialPoints: initial, collectedPoints: 0 }
+                return { initialPoints: initial, collectedPoints: 0, currentPoints: 0 }
             }
 
             // Open a new tab to where the tasks are going to be completed
@@ -147,10 +148,12 @@ export class DesktopFlow {
 
             // Fetch points BEFORE closing (avoid page closed reload error)
             const after = await this.bot.browser.func.getCurrentPoints().catch(() => initial)
+            this.bot.log(false, 'DESKTOP-FLOW', `The script collected ${after - initial} points today`)
 
             return {
                 initialPoints: initial,
-                collectedPoints: (after - initial) || 0
+                collectedPoints: (after - initial) || 0,
+                currentPoints: after
             }
         } finally {
             if (!keepBrowserOpen) {

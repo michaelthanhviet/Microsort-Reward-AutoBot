@@ -230,6 +230,7 @@ export async function ConclusionWebhookEnhanced(config: Config, data: Conclusion
             accountLines.push(`${statusIcon} **${emailShort}**`)
             accountLines.push(`└ Points: **+${acc.totalCollected}** (🖥️ ${acc.desktopCollected} • 📱 ${acc.mobileCollected})`)
             accountLines.push(`└ Duration: ${formatDuration(acc.durationMs)}`)
+            accountLines.push(`└ AvailablePoints: ${acc.endTotal}`)
             
             if (acc.banned?.status) {
                 accountLines.push(`└ 🚫 **Banned:** ${acc.banned.reason || 'Account suspended'}`)

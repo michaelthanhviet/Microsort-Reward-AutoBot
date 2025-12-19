@@ -28,6 +28,7 @@ export class Search extends Workers {
 
     public async doSearch(page: Page, data: DashboardData) {
         this.bot.log(this.bot.isMobile, 'SEARCH-BING', 'Starting Bing searches')
+        //this.bot.log(this.bot.isMobile, 'SEARCH-BING-DATA', `data: ${data.punchCards[0]?.name}`)
 
         // IMPROVED: Add error handling for getLatestTab to prevent early flow failure
         try {
@@ -100,8 +101,18 @@ export class Search extends Workers {
         }
 
         // Go to bing
+        // const activateLinks = page.locator('span:has-text("Activate now >")');
+        // await activateLinks.waitFor({ state: 'visible', timeout: 5000 });
+        // if (await activateLinks.count() >= 2) {
+        //     await activateLinks.nth(1).click(); // click cái thứ 2
+        //     // 2️⃣ Click legal action link
+        //     const legalLink = page.locator('span:has-text("Activate now")');
+        //     await legalLink.waitFor({ state: 'visible', timeout: 5000 });
+        //     await legalLink.click();
+        // } else {
+        //     await page.goto(this.searchPageURL ? this.searchPageURL : this.bingHome)
+        // }
         await page.goto(this.searchPageURL ? this.searchPageURL : this.bingHome)
-
         await this.bot.utils.wait(2000)
 
         await this.bot.browser.utils.tryDismissAllMessages(page)

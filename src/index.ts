@@ -975,6 +975,8 @@ export class MicrosoftRewardsBot {
         let mobileInitial = 0;
         let desktopCollected = 0;
         let mobileCollected = 0;
+        let desktopAfter = 0;
+        let mobileAfter = 0;
         const errors: string[] = [];
         const banned = { status: false, reason: '' }; // Dùng biến cục bộ
 
@@ -1024,6 +1026,7 @@ export class MicrosoftRewardsBot {
             if (desktopResult.status === 'fulfilled' && desktopResult.value) {
                 desktopInitial = desktopResult.value.initialPoints;
                 desktopCollected = desktopResult.value.collectedPoints;
+                desktopAfter = desktopResult.value.currentPoints;
             } else if (desktopResult.status === 'rejected') {
                 log(false, 'TASK', `Desktop promise rejected unexpectedly: ${shortErr(desktopResult.reason)}`,'error');
                 errors.push(formatFullErr('desktop-rejected', desktopResult.reason));
@@ -1033,6 +1036,7 @@ export class MicrosoftRewardsBot {
             if (mobileResult.status === 'fulfilled' && mobileResult.value) {
                 mobileInitial = mobileResult.value.initialPoints;
                 mobileCollected = mobileResult.value.collectedPoints;
+                mobileAfter = mobileResult.value.currentPoints;
             } else if (mobileResult.status === 'rejected') {
                 log(true, 'TASK', `Mobile promise rejected unexpectedly: ${shortErr(mobileResult.reason)}`,'error');
                 errors.push(formatFullErr('mobile-rejected', mobileResult.reason));
@@ -1058,6 +1062,7 @@ export class MicrosoftRewardsBot {
                 if (desktopResult) {
                     desktopInitial = desktopResult.initialPoints;
                     desktopCollected = desktopResult.collectedPoints;
+                    desktopAfter = desktopResult.currentPoints;
                 }
                 this.isDesktopRunning = false;
 
@@ -1077,6 +1082,7 @@ export class MicrosoftRewardsBot {
                     if (mobileResult) {
                         mobileInitial = mobileResult.initialPoints;
                         mobileCollected = mobileResult.collectedPoints;
+                        mobileAfter = mobileResult.currentPoints;
                     }
                     this.isMobileRunning = false;
                 } else {
@@ -1098,7 +1104,7 @@ export class MicrosoftRewardsBot {
         if (baselines.length === 1) initialTotal = baselines[0]!;
         else if (baselines.length === 2) initialTotal = Math.min(baselines[0]!, baselines[1]!);
         if (initialTotal === 0 && (desktopInitial || mobileInitial)) initialTotal = desktopInitial || mobileInitial || 0;
-        const endTotal = initialTotal + totalCollected;
+        const endTotal = (desktopAfter > mobileAfter)? desktopAfter : mobileAfter;
         
         // Cập nhật đối tượng Summary
         summary = {
@@ -1218,7 +1224,7 @@ export class MicrosoftRewardsBot {
     async Mobile(
         account: Account,
         retryTracker = new MobileRetryTracker(this.config.searchSettings.retryMobileSearchAmount)
-    ): Promise<{ initialPoints: number; collectedPoints: number }> {
+    ): Promise<{ initialPoints: number; collectedPoints: number, currentPoints: number }> {
         log(true, 'FLOW', 'Mobile() - delegating to MobileFlow module')
         const mobileFlow = new MobileFlow(this)
         return await mobileFlow.run(account, retryTracker)

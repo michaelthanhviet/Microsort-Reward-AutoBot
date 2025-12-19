@@ -1,5 +1,5 @@
 #Persistent
-SetTimer, KillPopup, 1000
+SetTimer, KillPopup, 500
 return
 
 KillPopup:
