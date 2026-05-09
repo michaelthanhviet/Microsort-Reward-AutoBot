@@ -1,4 +1,4 @@
-import { Page } from 'rebrowser-playwright'
+import { Page } from 'patchright'
 import type { ConfigHumanization } from '../../interface/Config'
 import { Util } from '../Utils'
 

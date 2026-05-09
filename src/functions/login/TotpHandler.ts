@@ -1,4 +1,4 @@
-import type { Locator, Page } from 'playwright'
+import type { Locator, Page } from 'patchright'
 import readline from 'readline'
 import { MicrosoftRewardsBot } from '../../index'
 import { HumanTyping } from '../../util/browser/HumanTyping'

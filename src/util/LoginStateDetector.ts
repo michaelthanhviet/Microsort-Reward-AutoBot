@@ -1,4 +1,4 @@
-import type { Page } from 'playwright'
+import type { Page } from 'patchright'
 
 /**
  * Login flow states for better tracking and debugging

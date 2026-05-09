@@ -1,6 +1,6 @@
 import path from 'path'
 import fs from 'fs'
-import type { Page } from 'rebrowser-playwright'
+import type { Page } from 'patchright'
 import type { MicrosoftRewardsBot } from '../index'
 
 export type DiagnosticsScope = 'default' | 'security'

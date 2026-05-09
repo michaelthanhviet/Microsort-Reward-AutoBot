@@ -1,7 +1,6 @@
 import cluster from 'cluster'
 import type { Worker } from 'cluster'
-// Use Page type from playwright for typings; at runtime rebrowser-playwright extends playwright
-import type { Page } from 'playwright'
+import type { Page } from 'patchright'
 import type { AxiosRequestConfig } from 'axios'
 import { createBrowserInstance } from './util/browser/BrowserFactory'
 import BrowserFunc from './browser/BrowserFunc'
