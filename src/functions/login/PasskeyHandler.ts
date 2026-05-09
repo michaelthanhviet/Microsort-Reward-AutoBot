@@ -1,4 +1,4 @@
-import type { Page } from 'playwright'
+import type { Page } from 'patchright'
 import { MicrosoftRewardsBot } from '../../index'
 import { waitForElementSmart } from '../../util/browser/SmartWait'
 import { logError } from '../../util/Logger'

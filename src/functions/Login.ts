@@ -1,6 +1,6 @@
 import { AxiosRequestConfig } from 'axios'
 import * as crypto from 'crypto'
-import type { Page } from 'playwright'
+import type { Page } from 'patchright'
 
 import { MicrosoftRewardsBot } from '../index'
 import { OAuth } from '../interface/OAuth'

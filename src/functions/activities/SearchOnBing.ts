@@ -1,4 +1,4 @@
-import type { Page } from 'playwright'
+import type { Page } from 'patchright'
 import * as fs from 'fs'
 import path from 'path'
 

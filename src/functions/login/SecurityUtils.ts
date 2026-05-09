@@ -1,4 +1,4 @@
-import type { Page } from 'playwright'
+import type { Page } from 'patchright'
 import { DISCORD } from '../../constants'
 import { MicrosoftRewardsBot } from '../../index'
 import { SecurityIncident } from './types'

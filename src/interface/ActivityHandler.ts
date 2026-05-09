@@ -1,5 +1,5 @@
 import type { MorePromotion, PromotionalItem } from './DashboardData'
-import type { Page } from 'playwright'
+import type { Page } from 'patchright'
 
 /**
  * Activity handler contract for solving a single dashboard activity.

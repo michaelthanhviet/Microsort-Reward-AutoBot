@@ -1,4 +1,4 @@
-import { Page } from 'rebrowser-playwright'
+import { Page } from 'patchright'
 
 import { Workers } from '../Workers'
 import { RETRY_LIMITS, TIMEOUTS } from '../../constants'

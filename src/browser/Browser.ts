@@ -1,6 +1,6 @@
 import { FingerprintGenerator } from 'fingerprint-generator'
 import { newInjectedContext } from 'fingerprint-injector'
-import playwright, { BrowserContext } from 'rebrowser-playwright'
+import playwright, { BrowserContext } from 'patchright'
 
 import { MicrosoftRewardsBot } from '../index'
 import { AccountProxy } from '../interface/Account'
@@ -30,7 +30,7 @@ class Browser {
             }
         }
 
-        let browser: import('rebrowser-playwright').Browser
+        let browser: import('patchright').Browser
         try {
             const envForceHeadless = process.env.FORCE_HEADLESS === '1'
             const headless = envForceHeadless ? true : (this.bot.config.browser?.headless ?? false)
@@ -80,6 +80,7 @@ class Browser {
 
             browser = await playwright.chromium.launch({
                 headless,
+                channel: 'chrome',
                 ...(proxyConfig && { proxy: proxyConfig }),
                 args: [...baseArgs, ...linuxStabilityArgs],
                 timeout: isLinux ? 90000 : 60000
@@ -110,7 +111,8 @@ class Browser {
             throw new Error(`Fingerprint validation failed for ${email}: ${validationResult.criticalIssues.join(', ')}`)
         }
 
-        const context = await newInjectedContext(browser as unknown as import('playwright').Browser, { fingerprint: fingerprint })
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const context = await newInjectedContext(browser as any, { fingerprint: fingerprint })
 
         const globalTimeout = this.bot.config.browser?.globalTimeout ?? 30000
         context.setDefaultTimeout(typeof globalTimeout === 'number' ? globalTimeout : this.bot.utils.stringToMs(globalTimeout))
@@ -298,7 +300,7 @@ class Browser {
 
         this.bot.log(this.bot.isMobile, 'BROWSER', `Browser ready with UA: "${fingerprint.fingerprint.navigator.userAgent}"`)
 
-        return context as BrowserContext
+        return context as unknown as BrowserContext
     }
 
     private buildPlaywrightProxy(proxy: AccountProxy): { server: string; username?: string; password?: string } | undefined {
